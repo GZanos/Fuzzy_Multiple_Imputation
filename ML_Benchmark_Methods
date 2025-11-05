@@ -1,16 +1,4 @@
-# ==================================================================================================
-# Generalized Imputation Methods 
-# ==================================================================================================
-# WORKFLOW:
-# 1. Separate training data into:
-#    - Complete cases: rows where target is not NA
-#    - Missing cases: rows where target is NA
-# 2. Split complete cases into train/test 
-# 3. Train each imputation method on Train set only 
-# 4. Evaluate on Test set 
-# 5. Retrain on all complete cases and predict the actual missing values
-# 6. Compare against validation set as sanity check 
-# ==================================================================================================
+
 
 # USER CONFIGURATION
 # ===================
