@@ -1,0 +1,565 @@
+# ==================================================================================================
+# GAIN (Generative Adversarial Imputation Nets)
+# Uses Generative Adversarial Networks for data imputation
+# ==================================================================================================
+#
+# REQUIREMENTS: Python 3.6+ with TensorFlow
+#   reticulate::py_install(c("numpy", "tensorflow"))
+#
+# ==================================================================================================
+
+# USER CONFIGURATION
+# ===================
+DATASET_NAME <- "travelTimes"
+
+# GAIN Hyperparameters
+GAIN_CONFIG <- list(
+  batch_size = 128,        # Batch size for training
+  hint_rate = 0.9,         # Hint rate (proportion of mask revealed to discriminator)
+  alpha = 100,             # Hyperparameter for reconstruction loss weight
+  iterations = 5000,       # Number of training iterations (reduced from 10000 for speed)
+  h_dim = 256,             # Hidden layer dimension
+  learning_rate = 0.001,   # Learning rate
+  m = 10                   # Number of imputations to generate
+)
+
+# Set to TRUE to use simplified version (no TensorFlow needed)
+# Set to FALSE to use full GAIN with TensorFlow (requires installation)
+USE_SIMPLIFIED_VERSION <- FALSE  
+
+# ==================================================================================================
+# Setup and Data Loading
+# ==================================================================================================
+
+req <- c("reticulate", "Metrics", "dplyr")
+to_install <- setdiff(req, rownames(installed.packages()))
+if(length(to_install)) install.packages(to_install, dependencies = TRUE)
+
+library(reticulate)
+library(Metrics)
+library(dplyr)
+
+id_col <- "col_ID"
+target_col <- "Target"
+set.seed(123)
+
+# File paths
+train_file <- paste0(DATASET_NAME, "_train.csv")
+validate_file <- paste0(DATASET_NAME, "_validate.csv")
+
+if(!file.exists(train_file)) stop(paste("Training file not found:", train_file))
+if(!file.exists(validate_file)) stop(paste("Validation file not found:", validate_file))
+
+cat("\n")
+cat("==================================================\n")
+cat("GAIN (Generative Adversarial Imputation Nets)\n")
+cat("==================================================\n")
+cat("Dataset:", DATASET_NAME, "\n")
+if(USE_SIMPLIFIED_VERSION) {
+  cat("Mode: SIMPLIFIED (No TensorFlow required)\n")
+} else {
+  cat("Mode: FULL GAIN (Requires TensorFlow)\n")
+}
+cat("\n")
+
+# Load data
+train <- read.csv(train_file, stringsAsFactors = FALSE)
+validate <- read.csv(validate_file, stringsAsFactors = FALSE)
+
+if(is.character(train[[target_col]])) {
+  train[[target_col]][trimws(train[[target_col]]) == ""] <- NA
+}
+train[[target_col]] <- suppressWarnings(as.numeric(train[[target_col]]))
+
+missing_ids <- train[[id_col]][is.na(train[[target_col]])]
+cat("Number of missing values to impute:", length(missing_ids), "\n")
+
+true_vals <- validate[validate[[id_col]] %in% missing_ids, c(id_col, target_col)]
+colnames(true_vals) <- c(id_col, "true_value")
+
+# Ensure all predictor columns are numeric
+feature_cols <- setdiff(colnames(train), c(id_col, target_col))
+for (fc in feature_cols) {
+  if(!is.numeric(train[[fc]])) {
+    train[[fc]] <- suppressWarnings(as.numeric(train[[fc]]))
+  }
+}
+
+cat("Number of predictor features:", length(feature_cols), "\n")
+cat("\n")
+
+# ==================================================================================================
+# Performance Metrics
+# ==================================================================================================
+
+safe_mape <- function(actual, pred) {
+  actual <- as.numeric(actual)
+  pred <- as.numeric(pred)
+  ok <- !is.na(actual) & !is.na(pred) & (actual != 0)
+  if(!any(ok)) return(NA_real_)
+  mean(abs((pred[ok] - actual[ok]) / actual[ok]))
+}
+
+compute_metrics <- function(actual, pred) {
+  data.frame(
+    MSE = mean((pred - actual)^2, na.rm = TRUE),
+    MAE = mean(abs(pred - actual), na.rm = TRUE),
+    RMSE = sqrt(mean((pred - actual)^2, na.rm = TRUE)),
+    MAPE = safe_mape(actual, pred)
+  )
+}
+
+# ==================================================================================================
+# GAIN Implementation
+# ==================================================================================================
+
+cat("==================================================\n")
+cat("Running GAIN Imputation\n")
+cat("==================================================\n")
+cat("Configuration:\n")
+cat("  Batch size:", GAIN_CONFIG$batch_size, "\n")
+cat("  Hint rate:", GAIN_CONFIG$hint_rate, "\n")
+cat("  Alpha:", GAIN_CONFIG$alpha, "\n")
+cat("  Iterations:", GAIN_CONFIG$iterations, "\n")
+cat("  Hidden dimension:", GAIN_CONFIG$h_dim, "\n")
+cat("  Number of imputations:", GAIN_CONFIG$m, "\n")
+cat("\n")
+
+gain_result <- tryCatch({
+  
+  # Prepare data
+  train_data <- train[, setdiff(colnames(train), id_col)]
+  data_matrix <- as.matrix(train_data)
+  
+  # Validate input data
+  cat("Input data validation:\n")
+  cat("  Data dimensions:", nrow(data_matrix), "rows x", ncol(data_matrix), "cols\n")
+  cat("  Missing values:", sum(is.na(data_matrix)), "\n")
+  cat("  Data range:", range(data_matrix, na.rm = TRUE), "\n")
+  
+  # Check if there's any non-missing data
+  if(all(is.na(data_matrix))) {
+    stop("All input data is missing!")
+  }
+  
+  # Check if target column has any missing values to impute
+  target_idx <- which(colnames(train_data) == target_col)
+  cat("  Target column missing:", sum(is.na(data_matrix[, target_idx])), "\n")
+  cat("\n")
+  
+  # Import numpy
+  np <- import("numpy")
+  
+  # Ensure all config values are proper types
+  GAIN_CONFIG$m <- as.integer(GAIN_CONFIG$m)
+  GAIN_CONFIG$batch_size <- as.integer(GAIN_CONFIG$batch_size)
+  GAIN_CONFIG$iterations <- as.integer(GAIN_CONFIG$iterations)
+  GAIN_CONFIG$h_dim <- as.integer(GAIN_CONFIG$h_dim)
+  
+  if(USE_SIMPLIFIED_VERSION) {
+    
+    # ============================================================================
+    # SIMPLIFIED VERSION (No TensorFlow needed)
+    # ============================================================================
+    cat("Using SIMPLIFIED GAIN implementation (iterative mean matching)...\n")
+    cat("Note: This is not the full GAN algorithm but captures the iterative refinement concept.\n\n")
+    
+    py$data_x <- np$array(data_matrix)
+    py$gain_params <- GAIN_CONFIG
+    
+    py_run_string("
+import numpy as np
+
+def simplified_gain(data_x, gain_parameters, m=10):
+    '''
+    Simplified GAIN using iterative refinement with random forests concept
+    This approximates the adversarial training without neural networks
+    '''
+    # Ensure m is integer
+    m = int(m)
+    
+    no, dim = data_x.shape
+    no = int(no)
+    dim = int(dim)
+    
+    print(f'Input data shape: {data_x.shape}')
+    print(f'Number of NaN values: {np.sum(np.isnan(data_x))}')
+    
+    # Create mask BEFORE normalization
+    mask = ~np.isnan(data_x)
+    
+    # Normalize data
+    norm_data = np.copy(data_x)
+    min_val = np.nanmin(norm_data, axis=0)
+    max_val = np.nanmax(norm_data, axis=0)
+    
+    # Avoid division by zero
+    range_val = max_val - min_val
+    range_val[range_val == 0] = 1.0
+    
+    norm_data = (norm_data - min_val) / range_val
+    
+    # Replace NaN with 0
+    norm_data = np.nan_to_num(norm_data, 0)
+    
+    print(f'After normalization - min: {np.min(norm_data)}, max: {np.max(norm_data)}')
+    
+    imputations = []
+    
+    for imp_iter in range(m):
+        # Start with column mean imputation
+        imputed = norm_data.copy()
+        
+        for col in range(dim):
+            missing_mask = ~mask[:, col]
+            
+            if np.any(missing_mask):
+                # Get observed values for this column
+                observed_values = norm_data[mask[:, col], col]
+                
+                if len(observed_values) > 0:
+                    # Use mean + small random noise for diversity
+                    col_mean = np.mean(observed_values)
+                    col_std = np.std(observed_values)
+                    if col_std == 0:
+                        col_std = 0.1
+                    
+                    # Add noise for multiple imputation diversity
+                    noise = np.random.normal(0, col_std * 0.1, np.sum(missing_mask))
+                    imputed[missing_mask, col] = col_mean + noise
+        
+        # Iterative refinement using other features
+        for iteration in range(10):  # Reduced iterations for speed
+            for col in range(dim):
+                missing_mask = ~mask[:, col]
+                
+                if np.any(missing_mask) and np.sum(mask[:, col]) > 0:
+                    # Use other columns to predict
+                    other_cols = [c for c in range(dim) if c != col and np.sum(mask[:, c]) > 3]
+                    
+                    if len(other_cols) > 0:
+                        # Get complete cases for training
+                        complete_mask = mask[:, col]
+                        for oc in other_cols:
+                            complete_mask = complete_mask & mask[:, oc]
+                        
+                        if np.sum(complete_mask) > 3:
+                            X_train = imputed[complete_mask][:, other_cols]
+                            y_train = norm_data[complete_mask, col]
+                            
+                            X_pred = imputed[missing_mask][:, other_cols]
+                            
+                            # Simple nearest neighbor
+                            for i in range(len(X_pred)):
+                                distances = np.sum((X_train - X_pred[i])**2, axis=1)
+                                k = min(3, len(X_train))
+                                nearest = np.argsort(distances)[:k]
+                                imputed[missing_mask, col][i] = np.mean(y_train[nearest])
+        
+        # Denormalize
+        imputed_denorm = imputed * range_val + min_val
+        
+        # Keep original observed values
+        final_imputed = np.where(mask, data_x, imputed_denorm)
+        
+        print(f'Imputation {imp_iter + 1}/{m} - NaN count: {np.sum(np.isnan(final_imputed))}')
+        
+        imputations.append(final_imputed)
+    
+    return imputations
+
+imputations_list = simplified_gain(data_x, gain_params, m=gain_params['m'])
+")
+    
+  } else {
+    
+    # ============================================================================
+    # FULL GAIN with TensorFlow
+    # ============================================================================
+    
+    # Check for TensorFlow
+    if(!py_module_available("tensorflow")) {
+      stop("TensorFlow not available. Either:\n",
+           "  1. Set USE_SIMPLIFIED_VERSION <- TRUE at the top of this script\n",
+           "  2. Install TensorFlow: reticulate::py_install('tensorflow')")
+    }
+    
+    cat("Using FULL GAIN implementation with TensorFlow...\n")
+    cat("This may take several minutes depending on iterations...\n\n")
+    
+    py$data_x <- np$array(data_matrix)
+    py$gain_params <- GAIN_CONFIG
+    
+    py_run_string("
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+def gain_imputation(data_x, gain_parameters):
+    '''Full GAIN implementation with TensorFlow'''
+    
+    batch_size = int(gain_parameters['batch_size'])
+    hint_rate = float(gain_parameters['hint_rate'])
+    alpha = float(gain_parameters['alpha'])
+    iterations = int(gain_parameters['iterations'])
+    h_dim = int(gain_parameters['h_dim'])
+    lr = float(gain_parameters['learning_rate'])
+    
+    no, dim = data_x.shape
+    no = int(no)
+    dim = int(dim)
+    
+    # Normalize
+    norm_data = np.copy(data_x)
+    min_val = np.nanmin(norm_data, axis=0)
+    max_val = np.nanmax(norm_data, axis=0)
+    norm_data = (norm_data - min_val) / (max_val - min_val + 1e-6)
+    
+    mask = 1 - np.isnan(norm_data)
+    norm_data = np.nan_to_num(norm_data, 0)
+    
+    # Generator
+    def generator(x, m):
+        inputs = tf.concat([x, m], axis=1)
+        G_h1 = layers.Dense(h_dim, activation='relu')(inputs)
+        G_h2 = layers.Dense(h_dim, activation='relu')(G_h1)
+        G_out = layers.Dense(dim, activation='sigmoid')(G_h2)
+        return G_out
+    
+    # Discriminator
+    def discriminator(x, h):
+        inputs = tf.concat([x, h], axis=1)
+        D_h1 = layers.Dense(h_dim, activation='relu')(inputs)
+        D_h2 = layers.Dense(h_dim, activation='relu')(D_h1)
+        D_out = layers.Dense(dim, activation='sigmoid')(D_h2)
+        return D_out
+    
+    # Build models
+    X_input = keras.Input(shape=(dim,))
+    M_input = keras.Input(shape=(dim,))
+    H_input = keras.Input(shape=(dim,))
+    
+    G_sample = generator(X_input, M_input)
+    Hat_X = M_input * X_input + (1 - M_input) * G_sample
+    D_prob = discriminator(Hat_X, H_input)
+    
+    generator_model = keras.Model(inputs=[X_input, M_input], outputs=G_sample)
+    discriminator_model = keras.Model(inputs=[X_input, M_input, H_input], outputs=D_prob)
+    
+    G_optimizer = keras.optimizers.Adam(learning_rate=lr)
+    D_optimizer = keras.optimizers.Adam(learning_rate=lr)
+    
+    # Training
+    print('Starting GAIN training...')
+    for it in range(iterations):
+        batch_idx = np.random.choice(no, min(int(batch_size), int(no)), replace=False)
+        X_mb = norm_data[batch_idx, :]
+        M_mb = mask[batch_idx, :]
+        
+        H_mb = np.random.binomial(1, hint_rate, [len(batch_idx), int(dim)])
+        H_mb = M_mb * H_mb
+        
+        X_mb_t = tf.constant(X_mb, dtype=tf.float32)
+        M_mb_t = tf.constant(M_mb, dtype=tf.float32)
+        H_mb_t = tf.constant(H_mb, dtype=tf.float32)
+        
+        # Train Discriminator
+        with tf.GradientTape() as tape:
+            G_sample = generator_model([X_mb_t, M_mb_t])
+            Hat_X = M_mb_t * X_mb_t + (1 - M_mb_t) * G_sample
+            D_prob = discriminator_model([Hat_X, M_mb_t, H_mb_t])
+            D_loss = -tf.reduce_mean(M_mb_t * tf.math.log(D_prob + 1e-8) + 
+                                    (1 - M_mb_t) * tf.math.log(1 - D_prob + 1e-8))
+        
+        D_grads = tape.gradient(D_loss, discriminator_model.trainable_variables)
+        D_optimizer.apply_gradients(zip(D_grads, discriminator_model.trainable_variables))
+        
+        # Train Generator
+        with tf.GradientTape() as tape:
+            G_sample = generator_model([X_mb_t, M_mb_t])
+            Hat_X = M_mb_t * X_mb_t + (1 - M_mb_t) * G_sample
+            D_prob = discriminator_model([Hat_X, M_mb_t, H_mb_t])
+            G_loss1 = -tf.reduce_mean((1 - M_mb_t) * tf.math.log(D_prob + 1e-8))
+            G_loss2 = tf.reduce_mean((M_mb_t * X_mb_t - M_mb_t * G_sample) ** 2) / tf.reduce_mean(M_mb_t)
+            G_loss = G_loss1 + alpha * G_loss2
+        
+        G_grads = tape.gradient(G_loss, generator_model.trainable_variables)
+        G_optimizer.apply_gradients(zip(G_grads, generator_model.trainable_variables))
+        
+        if it % 500 == 0:
+            print(f'Iteration {it}/{iterations}: D_loss={float(D_loss):.4f}, G_loss={float(G_loss):.4f}')
+    
+    print('Training completed!')
+    
+    # Generate final imputation
+    M_full = tf.constant(mask, dtype=tf.float32)
+    X_full = tf.constant(norm_data, dtype=tf.float32)
+    imputed_data = generator_model([X_full, M_full]).numpy()
+    imputed_data = mask * norm_data + (1 - mask) * imputed_data
+    imputed_data = imputed_data * (max_val - min_val + 1e-6) + min_val
+    
+    return imputed_data
+
+def gain_multiple_imputation(data_x, gain_parameters, m=10):
+    '''Generate multiple imputations'''
+    m = int(m)
+    imputations = []
+    for i in range(m):
+        print(f'\\nGenerating imputation {i+1}/{m}...')
+        imputed = gain_imputation(data_x, gain_parameters)
+        imputations.append(imputed)
+    return imputations
+
+imputations_list = gain_multiple_imputation(data_x, gain_params, m=gain_params['m'])
+")
+  }
+  
+  # Get results
+  imputations_list <- py$imputations_list
+  
+  cat("\nGAIN imputation completed!\n")
+  
+  # Debug: Check what we got back
+  cat("Number of imputations returned:", length(imputations_list), "\n")
+  if(length(imputations_list) > 0) {
+    first_imp <- imputations_list[[1]]
+    cat("First imputation dimensions:", dim(first_imp), "\n")
+    cat("First imputation NA count:", sum(is.na(first_imp)), "\n")
+    cat("First imputation range:", range(first_imp, na.rm = TRUE), "\n")
+  }
+  cat("\n")
+  
+  # Check if we got valid data
+  if(length(imputations_list) == 0 || all(is.na(imputations_list[[1]]))) {
+    stop("Imputation returned no valid data. Check input data for issues.")
+  }
+  
+  # Average across imputations
+  m_value <- as.integer(GAIN_CONFIG$m)
+  all_imputations_array <- array(
+    unlist(imputations_list), 
+    dim = c(nrow(data_matrix), ncol(data_matrix), m_value)
+  )
+  averaged_imputations <- apply(all_imputations_array, c(1, 2), mean, na.rm = TRUE)
+  
+  # Create completed dataset
+  completed_data <- as.data.frame(averaged_imputations)
+  colnames(completed_data) <- colnames(train_data)
+  completed_data[[id_col]] <- train[[id_col]]
+  
+  # Get imputed target values
+  target_col_idx <- which(colnames(train_data) == target_col)
+  imputed_vals <- data.frame(
+    col_ID = train[[id_col]][is.na(train[[target_col]])],
+    imputed_value = averaged_imputations[is.na(train[[target_col]]), target_col_idx]
+  )
+  colnames(imputed_vals)[1] <- id_col
+  
+  # Debug: Check imputed values
+  cat("Imputed values summary:\n")
+  cat("  Count:", nrow(imputed_vals), "\n")
+  cat("  NA count:", sum(is.na(imputed_vals$imputed_value)), "\n")
+  cat("  Range:", range(imputed_vals$imputed_value, na.rm = TRUE), "\n")
+  cat("\n")
+  
+  # Merge with true values
+  comparison <- merge(true_vals, imputed_vals, by = id_col)
+  
+  # Check if we have valid comparisons
+  if(nrow(comparison) == 0) {
+    stop("No matching IDs between imputed values and validation set")
+  }
+  
+  cat("Comparison data:\n")
+  cat("  Rows:", nrow(comparison), "\n")
+  cat("  True values range:", range(comparison$true_value, na.rm = TRUE), "\n")
+  cat("  Imputed values range:", range(comparison$imputed_value, na.rm = TRUE), "\n")
+  cat("\n")
+  
+  # Calculate metrics
+  metrics <- compute_metrics(comparison$true_value, comparison$imputed_value)
+  
+  # Final check
+  if(all(is.na(metrics))) {
+    cat("WARNING: All metrics are NA. Possible issues:\n")
+    cat("  - Imputed values may be all NA\n")
+    cat("  - True values may be all NA\n")
+    cat("  - Comparison may have failed\n")
+    print(head(comparison))
+  }
+  
+  list(
+    success = TRUE,
+    method = ifelse(USE_SIMPLIFIED_VERSION, "GAIN_Simplified", "GAIN_Full"),
+    metrics = metrics,
+    comparison = comparison,
+    completed_data = completed_data
+  )
+  
+}, error = function(e) {
+  cat("\nError in GAIN:\n")
+  cat(e$message, "\n\n")
+  
+  if(grepl("tensorflow|module", e$message, ignore.case = TRUE)) {
+    cat("Missing TensorFlow. Options:\n")
+    cat("  1. Set USE_SIMPLIFIED_VERSION <- TRUE (easier, no TensorFlow needed)\n")
+    cat("  2. Install TensorFlow: reticulate::py_install('tensorflow')\n\n")
+  }
+  
+  list(
+    success = FALSE,
+    method = "GAIN",
+    error = e$message
+  )
+})
+
+# ==================================================================================================
+# Results Summary
+# ==================================================================================================
+
+cat("\n")
+cat("==================================================\n")
+cat("RESULTS SUMMARY\n")
+cat("==================================================\n")
+
+if(gain_result$success) {
+  cat("Method:", gain_result$method, "\n")
+  cat("Status: SUCCESS\n\n")
+  
+  if(USE_SIMPLIFIED_VERSION) {
+    cat("Note: This used the simplified version (iterative refinement).\n")
+    cat("For full GAN training, set USE_SIMPLIFIED_VERSION <- FALSE\n\n")
+  }
+  
+  cat("Performance Metrics:\n")
+  cat(sprintf("  MSE:  %.6f\n", gain_result$metrics$MSE))
+  cat(sprintf("  MAE:  %.6f\n", gain_result$metrics$MAE))
+  cat(sprintf("  RMSE: %.6f\n", gain_result$metrics$RMSE))
+  cat(sprintf("  MAPE: %.6f\n", gain_result$metrics$MAPE))
+  cat("\n")
+  
+  # Save results
+  method_name <- ifelse(USE_SIMPLIFIED_VERSION, "GAIN_Simplified", "GAIN_Full")
+  results_file <- paste0(DATASET_NAME, "_", method_name, "_results.csv")
+  write.csv(gain_result$metrics, results_file, row.names = FALSE)
+  cat("Results saved to:", results_file, "\n")
+  
+  comparison_file <- paste0(DATASET_NAME, "_", method_name, "_actual_vs_imputed.csv")
+  write.csv(gain_result$comparison, comparison_file, row.names = FALSE)
+  cat("Comparison saved to:", comparison_file, "\n")
+  
+  completed_file <- paste0(DATASET_NAME, "_", method_name, "_completed.csv")
+  write.csv(gain_result$completed_data, completed_file, row.names = FALSE)
+  cat("Completed dataset saved to:", completed_file, "\n")
+  
+} else {
+  cat("Method: GAIN\n")
+  cat("Status: FAILED\n")
+  cat("Error:", gain_result$error, "\n")
+}
+
+cat("\n")
+cat("==================================================\n")
+cat("Script completed!\n")
+cat("==================================================\n")
