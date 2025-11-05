@@ -1,0 +1,628 @@
+# ==================================================================================================
+# Generalized FBLiR (Fuzzy Bayesian Linear Regression) Imputation Method
+# ==================================================================================================
+
+## This code has been fully generalized, with changes to the following lines only:
+  # line 15, and 75-76 for your repository location format
+  # line 18 for your dataset name
+  # lines 23-35 for preferred model parameter settings and tuning settings
+
+
+# USER CONFIGURATION
+# ===================
+
+# Change this to your repository
+setwd("~/Desktop/...")
+source(paste0(getwd(), "/DBDA2E-utilities.R"))
+
+DATASET_NAME <- "Maternal_Health"  
+
+# FBLIR Hyperparameter Configuration
+# ===================================
+# JAGS MCMC Settings
+JAGS_N_CHAINS <- 2      
+JAGS_ADAPT <- 500      
+JAGS_BURNIN <- 1000     
+JAGS_THIN <- 7          
+JAGS_SAMPLE <- 2000    
+JAGS_PLOT_DIAGNOSTICS <- FALSE 
+
+# Hyperparameter Grid Search Settings
+M_VALUES <- seq(-1, 1, by = 0.1)
+SYMMETRY_THRESHOLDS <- c(0.1, 0.5, 1)
+K_VALUES <- seq(-1, 1, by = 0.1)
+UNCERTAINTY_WEIGHTS <- c(0, 0.25, 0.75, 1)
+FUZZIFY_SCALES <- c(0.01, 0.05, 0.1)  
+
+
+# ==================================================================================================
+# Setup and Data Loading
+# ==================================================================================================
+
+# --- Packages ---
+req <- c("Metrics","dplyr", "rjags", "runjags", "coda")
+to_install <- setdiff(req, rownames(installed.packages()))
+if(length(to_install)) install.packages(to_install, dependencies = TRUE)
+
+library(Metrics)
+library(dplyr)
+library(rjags)
+library(runjags)
+library(coda)
+library(tictoc)
+
+# --- Configuration ---
+id_col <- "col_ID"
+target_col <- "Target"
+set.seed(123)
+
+# --- Load data ---
+train_file <- paste0(DATASET_NAME, "_train.csv")
+validate_file <- paste0(DATASET_NAME, "_validate.csv")
+
+cat("Loading dataset:", DATASET_NAME, "\n")
+cat("Train file:", train_file, "\n")
+cat("Validate file:", validate_file, "\n")
+
+# Check if files exist
+if(!file.exists(paste0(getwd(),"/Datasets/Train/",train_file))) {
+  stop("Training file not found: ", train_file)
+}
+if(!file.exists(paste0(getwd(),"/Datasets/Validate/",validate_file))) {
+  stop("Validation file not found: ", validate_file)
+}
+
+train <- read.csv(paste0(getwd(),"/Datasets/Train/",train_file), stringsAsFactors = FALSE)
+validate <- read.csv(paste0(getwd(),"/Datasets/Validate/",validate_file), stringsAsFactors = FALSE)
+
+
+# Convert target to numeric if it's character
+if(is.character(train[[target_col]])) {
+  train[[target_col]][trimws(train[[target_col]]) == ""] <- NA
+}
+train[[target_col]] <- suppressWarnings(as.numeric(train[[target_col]]))
+
+# --- Identify rows to impute & true values for validation ---
+missing_ids <- train[[id_col]][is.na(train[[target_col]])]
+cat("Found", length(missing_ids), "missing values to impute\n")
+
+# Get true values from validate set for the missing IDs
+true_vals <- validate[validate[[id_col]] %in% missing_ids, c(id_col, target_col)]
+colnames(true_vals) <- c(id_col, "true_target")
+
+cat("Retrieved", nrow(true_vals), "true values for validation\n")
+
+# --- Ensure predictors are numeric ---
+feature_cols <- setdiff(colnames(train), c(id_col, target_col))
+cat("Feature columns:", length(feature_cols), "->", paste(head(feature_cols, 5), collapse = ", "), 
+    if(length(feature_cols) > 5) "..." else "", "\n")
+
+for (fc in feature_cols) {
+  if(!is.numeric(train[[fc]])) {
+    train[[fc]] <- suppressWarnings(as.numeric(train[[fc]]))
+  }
+}
+
+# ==================================================================================================
+# Performance Metrics and Evaluation Functions
+# ==================================================================================================
+
+# --- Performance Metric helper ---
+safe_mape <- function(actual, pred) {
+  actual <- as.numeric(actual); pred <- as.numeric(pred)
+  ok <- !is.na(actual) & !is.na(pred) & (actual != 0)
+  if(!any(ok)) return(NA_real_)
+  mean(abs((pred[ok] - actual[ok]) / actual[ok]))
+}
+
+compute_metrics <- function(actual, pred) {
+  actual <- as.numeric(actual); pred <- as.numeric(pred)
+  data.frame(
+    MSE = mean((pred - actual)^2, na.rm = TRUE),
+    MAE = mean(abs(pred - actual), na.rm = TRUE),
+    RMSE = sqrt(mean((pred - actual)^2, na.rm = TRUE)),
+    MAPE = safe_mape(actual, pred),
+    check.names = FALSE
+  )
+}
+
+# --- Evaluation wrapper ---
+score_model <- function(model_name, imputed_vector, true_vector, id_col, ids) {
+  pred_df <- data.frame(id = true_vector[[id_col]],        
+                        imputed = as.numeric(imputed_vector)) 
+  colnames(pred_df)[1] <- id_col
+  
+  eval_df <- pred_df %>%
+    dplyr::filter(!!sym(id_col) %in% ids) %>%
+    inner_join(true_vals, by = id_col)
+  
+  if(nrow(eval_df) == 0) {
+    return(data.frame(Model = model_name, MSE = NA, MAE = NA, RMSE = NA, MAPE = NA))
+  }
+  
+  mets <- compute_metrics(eval_df$true_target, eval_df$imputed) 
+  
+  cbind(data.frame(Model = model_name), mets)
+}
+
+# ==================================================================================================
+# Required GFN (Generalized Fuzzy Number) Functions
+# ==================================================================================================
+
+# Fuzzification function
+fuzzify_feature <- function(feature, variance) {
+  feature <- as.numeric(feature)
+  n <- length(feature)
+  var_vec <- rep(variance, n)
+  cbind(Mean = feature, Variance = var_vec)
+}
+
+GFN.add <- function(A, B) {
+  A <- as.numeric(A); B <- as.numeric(B)
+  mean <- A[1] + B[1]
+  variance <- A[2] + B[2]
+  setNames(c(mean, variance), c("Mean", "Variance"))
+}
+
+GFN.multi <- function(A, B, symmetry.threshold = 4) {
+  A <- as.numeric(A); B <- as.numeric(B)
+  mean <- A[1] * B[1]
+  variance <- (B[2] * A[1]^2) + (A[2] * B[1]^2) + (B[2] * A[2])
+  
+  if ((mean != 0) & (abs(mean/sqrt(variance)) < symmetry.threshold )) {
+    while (abs(mean/sqrt(variance)) < symmetry.threshold ){
+      variance <- variance*0.1
+    }
+  }
+  setNames(c(mean, variance), c("Mean", "Variance"))
+}
+
+defuzzify <- function(gfn, k, m, symmetry.threshold) {
+  mean_val <- gfn[1]
+  var_val <- gfn[2]
+  
+  if (is.na(mean_val) || is.na(var_val) || var_val <= 0) {
+    return(mean_val)
+  }
+  
+  delta_val <- abs(mean_val / sqrt(var_val))
+  if (delta_val > symmetry.threshold) {
+    return(mean_val)
+  } else {
+    adj_factor <- m / (1 + exp(-k * (delta_val - symmetry.threshold)))
+    return(mean_val + adj_factor * var_val)
+  }
+}
+
+# ==================================================================================================
+# Initialize Results Storage
+# ==================================================================================================
+
+all_results <- list()
+actual_vs_imputed <- data.frame(
+  id = missing_ids,
+  actual = true_vals$true_target[match(missing_ids, true_vals[[id_col]])]
+)
+colnames(actual_vs_imputed)[1] <- id_col
+
+cat("\nStarting FBLiR imputation method...\n",
+    "====================================\n") 
+
+# ==================================================================================================
+# FBLiR Method (with Hyperparameter Tuning)
+# ==================================================================================================
+cat("Running GFN-FBLiR Method...\n",
+    "JAGS Configuration:\n",
+    "  - Chains:", JAGS_N_CHAINS, "\n",
+    "  - Adapt:", JAGS_ADAPT, "\n",
+    "  - Burnin:", JAGS_BURNIN, "\n",
+    "  - Thin:", JAGS_THIN, "\n",
+    "  - Sample:", JAGS_SAMPLE, "\n") 
+
+# Prepare data for JAGS
+X_full_df <- train[, feature_cols, drop = FALSE]
+Y_full <- train[, target_col]
+
+obs_idx <- which(!is.na(Y_full))
+miss_idx <- which(is.na(Y_full))
+
+if(length(obs_idx) > 10) {  # Need sufficient observations
+  cat("Sufficient observations found (", length(obs_idx), "), proceeding with FBLiR...\n")
+  
+  X_obs_matrix <- as.matrix(X_full_df[obs_idx, ])
+  x_means <- colMeans(X_obs_matrix, na.rm = TRUE)
+  x_sds <- apply(X_obs_matrix, 2, sd, na.rm = TRUE)
+  x_sds[x_sds == 0] <- 1e-6
+  X_obs_z <- scale(X_obs_matrix, center = x_means, scale = x_sds)
+  
+  Y_obs_raw <- Y_full[obs_idx] 
+  y_mean_train <- mean(Y_obs_raw, na.rm = TRUE)
+  y_sd_train <- sd(Y_obs_raw, na.rm = TRUE)
+  if (is.na(y_sd_train) || y_sd_train == 0) y_sd_train <- 1e-6
+  Y_obs_z <- (Y_obs_raw - y_mean_train) / y_sd_train
+  
+  
+  ###########################################################################
+  ####### Create JASG model text based on the number of features. ######
+  ####### The model here includes a linear only model and a model ######
+  ####### for each feature that has linear terms for all features ######
+  ####### plus a quadratic term for an individual feature.        ######
+  ###########################################################################
+  P <- ncol(X_obs_z)
+  modelString <- "
+  model {
+    for (i in 1:N_obs) {
+      y[i] ~ dnorm(mu[i], tau)
+      mu[i] <- ifelse( m == 1 , beta0 + inprod(beta[1:P], X[i,1:P]),"
+  for (i in 2:P){
+    modelString <- paste0(modelString, "ifelse( m == ", i, ", beta0 + inprod(beta[1:P], X[i,1:P]) + beta[P+", (i-1), "]*pow(X[i,", (i-1), "],2),")
+  }
+  modelString <- paste0(modelString, "beta0 + inprod(beta[1:P], X[i,1:P]) + beta[P+",P,"]*pow(X[i,", P, "],2)")
+  for (i in 1:P){
+    modelString <- paste0(modelString,")")
+  }
+  modelString <- paste0(modelString, "}
+    
+    # Priors with automatic relevance determination
+    beta0 ~ dnorm(0, tau_beta0)
+    tau_beta0 ~ dgamma(1, 1)
+    
+    for (j in 1:(2*P)) {
+      beta[j] ~ dnorm(0, tau_beta[j])
+      tau_beta[j] ~ dgamma(alpha_beta, beta_beta)
+    }
+    
+    # Hierarchical priors for regularization
+    alpha_beta ~ dgamma(1, 1)
+    beta_beta ~ dgamma(1, 1)
+    
+    # Prior for precision
+    tau ~ dgamma(1, 1)
+    sigma <- 1 / sqrt(tau)
+    
+    # Residual variance for uncertainty quantification
+    sigma2_resid <- 1/tau
+    
+    # Prior for model
+    m ~ dcat( mPriorProb[] )
+    for (j in 1:")
+  
+  modelString <- paste0(modelString, P+1, "){ mPriorProb[j] <- ", 1/(P+1), "} }")
+  
+  ####### Create JASG model text based on the number of features. ######
+  
+  
+  # modelString <- "
+  # model {
+  #   for (i in 1:N_obs) {
+  #     y[i] ~ dnorm(mu[i], tau)
+  #     mu[i] <- ifelse( m == 1 , beta0 + inprod(beta[1:P], X[i,1:P]),
+  #                               ifelse( m == 2, beta0 + inprod(beta[1:P], X[i,1:P]) + beta[P+1]*pow(X[i,1],2),
+  #                               ifelse( m == 3, beta0 + inprod(beta[1:P], X[i,1:P]) + beta[P+2]*pow(X[i,2],2),
+  #                               ifelse( m == 4, beta0 + inprod(beta[1:P], X[i,1:P]) + beta[P+3]*pow(X[i,3],2),
+  #                               ifelse( m == 5, beta0 + inprod(beta[1:P], X[i,1:P]) + beta[P+4]*pow(X[i,4],2),
+  #                               ifelse( m == 6, beta0 + inprod(beta[1:P], X[i,1:P]) + beta[P+5]*pow(X[i,5],2),
+  #                               ifelse( m == 7, beta0 + inprod(beta[1:P], X[i,1:P]) + beta[P+6]*pow(X[i,6],2),
+  #                               ifelse( m == 8, beta0 + inprod(beta[1:P], X[i,1:P]) + beta[P+7]*pow(X[i,7],2),
+  #                               ifelse( m == 9, beta0 + inprod(beta[1:P], X[i,1:P]) + beta[P+8]*pow(X[i,8],2),
+  #                               ifelse( m == 10, beta0 + inprod(beta[1:P], X[i,1:P]) + beta[P+9]*pow(X[i,9],2),
+  #                               beta0 + inprod(beta[1:P], X[i,1:P]) + beta[P+1]*pow(X[i,10],2) ))))))))))
+  #     # mu[i] <- ifelse( m == 1 , beta0 + inprod(beta[1:P], X[i,1:P]),
+  #     #                           beta0 + inprod(beta[1:P], X[i,1:P]) + beta[P+1]*pow(X[i,1],2))
+  #                                               
+  #   }
+  #   
+  #   # Priors with automatic relevance determination
+  #   beta0 ~ dnorm(0, tau_beta0)
+  #   tau_beta0 ~ dgamma(1, 1)
+  #   
+  #   for (j in 1:(2*P)) {
+  #     beta[j] ~ dnorm(0, tau_beta[j])
+  #     tau_beta[j] ~ dgamma(alpha_beta, beta_beta)
+  #   }
+  #   
+  #   # Hierarchical priors for regularization
+  #   alpha_beta ~ dgamma(1, 1)
+  #   beta_beta ~ dgamma(1, 1)
+  #   
+  #   # Prior for precision
+  #   tau ~ dgamma(1, 1)
+  #   sigma <- 1 / sqrt(tau)
+  #   
+  #   # Residual variance for uncertainty quantification
+  #   sigma2_resid <- 1/tau
+  #   
+  #   # Prior for model
+  #   m ~ dcat( mPriorProb[] )
+  #   for (j in 1:12){
+  #     mPriorProb[j] <- 1/12
+  #   }
+  # }
+  # "
+  
+  model_file <- paste0(DATASET_NAME, "_FBLR_model.txt")
+  writeLines(modelString, con = model_file)
+  
+  jags_data <- list(
+    X = as.matrix(X_obs_z),
+    y = as.numeric(Y_obs_z),
+    N_obs = nrow(X_obs_z),
+    P = ncol(X_obs_z)
+  )
+  
+  params_to_monitor <- c("beta0", "beta", "sigma", "tau_beta0", "tau_beta", "sigma2_resid", "m") 
+  
+  fblir_success <- FALSE
+  try({
+    tic()
+    cat("Running JAGS model...\n")
+    runJagsOut <- run.jags(
+      method="parallel" , 
+      model = model_file,
+      data = jags_data,
+      n.chains = JAGS_N_CHAINS,
+      adapt = JAGS_ADAPT,
+      burnin = JAGS_BURNIN,
+      thin = JAGS_THIN,
+      sample = JAGS_SAMPLE,
+      monitor = params_to_monitor
+    )
+    
+    mcmc_mat <- as.matrix(as.mcmc.list(runJagsOut))
+    cat("JAGS model completed successfully\n")
+    
+    #### MCMC diagnostics #######
+    if (JAGS_PLOT_DIAGNOSTICS){
+      mcmc_mat_diag <- as.mcmc.list(runJagsOut)
+      diagMCMC( codaObject = mcmc_mat_diag , parName="beta0" )
+      for ( i in 1:ncol(X_obs_z)){
+        diagMCMC( codaObject=mcmc_mat_diag , parName=paste0("beta[",i,"]") )
+      }
+      diagMCMC( codaObject=mcmc_mat_diag , parName="sigma" )
+      diagMCMC( codaObject=mcmc_mat_diag , parName="tau_beta0" )
+      for ( i in 1:ncol(X_obs_z)){
+        diagMCMC( codaObject=mcmc_mat_diag , parName=paste0("tau_beta[",i,"]") )
+      }
+      diagMCMC( codaObject=mcmc_mat_diag , parName="sigma2_resid" )
+    }
+    
+    # graphics.off()
+    #### diagnostics #######
+    
+    ### Process posterior model probabilities
+    m = mcmc_mat[,"m"]
+    # Compute the proportion of m at each index value:
+    nModels <- (ncol(X_obs_z)+1) 
+    pM <- array(NA, nModels)
+    for (i in 1:nModels){
+      pM[i] = sum( m == i ) / length( m )
+      cat(paste0("P(m = ",i," |D) = ", pM[i], "\n"))
+    }
+    
+    bestModelIndx <- which.max(pM) 
+    featureInxdInBestModel <- c(1:P, P + bestModelIndx - 1)
+    
+    # Get the coefficient names
+    coefNames <- c(colnames(X_obs_z))
+    for (i in 1:P){
+      coefNames <- c(coefNames,paste0(coefNames[i],"^2"))
+    }
+    
+    # Extract GFN coefficients
+    beta0_samples <- mcmc_mat[, "beta0"]
+    beta0_gfn <- c(mean(beta0_samples), var(beta0_samples))
+    
+    beta_gfn_matrix <- matrix(NA, nrow = length(featureInxdInBestModel), ncol = 2, 
+                              dimnames = list(coefNames[featureInxdInBestModel], c("Mean", "Variance")))
+    count <- 0 
+    for (j in featureInxdInBestModel) {
+      count <- count + 1
+      beta_col_name <- paste0("beta[", j, "]")
+      tau_beta_col_name <- paste0("tau_beta[", j, "]")
+      
+      beta_samples <- mcmc_mat[, beta_col_name]
+      tau_beta_samples <- mcmc_mat[, tau_beta_col_name]
+      
+      # Combine posterior sample variance with hierarchical prior uncertainty
+      beta_mean <- mean(beta_samples)
+      beta_var <- var(beta_samples)
+      beta_uncertainty <- mean(1/tau_beta_samples)
+      combined_var <- beta_var + 0.5 * beta_uncertainty
+      
+      beta_gfn_matrix[count, ] <- c(beta_mean, combined_var) 
+    }
+    
+    # Extract residual variance
+    sigma2_resid_samples <- mcmc_mat[, "sigma2_resid"]
+    sigma_gfn <- c(0, mean(sigma2_resid_samples))
+    
+    #Modify the observation matrix according to the best model
+    X_full_df <- cbind(X_full_df, X_full_df^2)
+    X_full_df <- X_full_df[ ,featureInxdInBestModel]
+    colnames(X_full_df) <- coefNames[featureInxdInBestModel]
+    
+    # Prepare standardized feature matrix for all observations
+    X_full_z <- sweep(as.matrix(X_full_df), 2, x_means, FUN = "-")
+    X_full_z <- sweep(X_full_z, 2, x_sds, FUN = "/")
+    X_full_z[is.na(X_full_z)] <- 0
+    
+    n_all <- nrow(X_full_z)
+    
+    # Hyperparameter grid search
+    fblr_grid <- expand.grid(
+      m = M_VALUES,
+      symmetry.threshold = SYMMETRY_THRESHOLDS,
+      k = K_VALUES,
+      uncertainty_weight = UNCERTAINTY_WEIGHTS,
+      fuzzify_variance = FUZZIFY_SCALES
+    )
+    
+    best_fblr_mae <- Inf
+    best_fblr_preds <- NULL
+    best_fblr_params <- NULL
+    
+    cat("\nHyperparameter Grid Search:\n",
+        "  - m values:", length(M_VALUES), "options:", paste(range(M_VALUES), collapse=" to "), "\n",
+        "  - symmetry thresholds:", length(SYMMETRY_THRESHOLDS), "options:", paste(SYMMETRY_THRESHOLDS, collapse=", "), "\n",
+        "  - k values:", length(K_VALUES), "options:", paste(range(K_VALUES), collapse=" to "), "\n",
+        "  - uncertainty weights:", length(UNCERTAINTY_WEIGHTS), "options:", paste(UNCERTAINTY_WEIGHTS, collapse=", "), "\n",
+        "  - fuzzify variances:", length(FUZZIFY_SCALES), "options:", paste(FUZZIFY_SCALES, collapse=", "), "\n",
+        "Testing", nrow(fblr_grid), "hyperparameter combinations...\n") 
+    
+    for (i in 1:nrow(fblr_grid)) {
+      params <- fblr_grid[i, ]
+      try({
+        # Apply uncertainty weighting to coefficient variances
+        beta_gfn_weighted <- beta_gfn_matrix
+        beta_gfn_weighted[, 2] <- beta_gfn_matrix[, 2] * params$uncertainty_weight + 
+          (1 - params$uncertainty_weight) * mean(beta_gfn_matrix[, 2])
+        
+        # FUZZIFY ALL FEATURES using fuzzify_feature() with current variance parameter
+        # This creates a list of fuzzified feature matrices (one per feature column)
+        fuzzified_features <- list()
+        for (col_j in 1:ncol(X_full_z)) {
+          fuzzified_features[[col_j]] <- fuzzify_feature(X_full_z[, col_j], params$fuzzify_variance)
+        }
+        
+        # GFN Arithmetic using fuzzified features
+        Y_estimated_weighted <- matrix(NA, nrow = n_all, ncol = 2,
+                                       dimnames = list(NULL, c("Mean", "Variance")))
+        
+        for (row_i in 1:n_all) { 
+          Y_gfn_temp <- beta0_gfn
+          
+          for (col_j in 1:ncol(X_full_z)) {
+            # Extract the fuzzified value for this observation and feature
+            X_gfn_temp <- fuzzified_features[[col_j]][row_i, ]  # [Mean, Variance]
+            product <- GFN.multi(beta_gfn_weighted[col_j, ], X_gfn_temp, symmetry.threshold = params$symmetry.threshold)
+            Y_gfn_temp <- GFN.add(Y_gfn_temp, product)
+          }
+          Y_gfn_temp <- GFN.add(Y_gfn_temp, sigma_gfn)
+          Y_estimated_weighted[row_i, ] <- Y_gfn_temp
+        }
+        
+        # Defuzzify predictions
+        pred_defuzzified_z <- apply(Y_estimated_weighted, 1, defuzzify,
+                                    k = params$k,
+                                    m = params$m,
+                                    symmetry.threshold = params$symmetry.threshold)
+        
+        # Rescale to original scale
+        pred_defuzzified_orig <- pred_defuzzified_z * y_sd_train + y_mean_train
+        
+        score <- cbind(data.frame(Model = "FBLR_Bayesian_Tune"), compute_metrics(actual = train[obs_idx, target_col], pred = pred_defuzzified_orig[obs_idx]) )
+        
+        
+        # Track best parameters
+        if(!is.na(score$MAE) && score$MAE < best_fblr_mae) { 
+          best_fblr_mae <- score$MAE
+          best_fblr_params <- params
+        }
+      }, silent = TRUE)
+      
+      # Progress indicator
+      if(i %% 500 == 0) {
+        cat("  Completed", i, "/", nrow(fblr_grid), "combinations\n")
+      }
+    }
+    
+    if(!is.null(best_fblr_params)) {
+      cat("\nBest FBLiR hyperparameters found:\n",
+          "  - m:", best_fblr_params$m, "\n",
+          "  - symmetry.threshold:", best_fblr_params$symmetry.threshold, "\n",
+          "  - k:", best_fblr_params$k, "\n",
+          "  - uncertainty_weight:", best_fblr_params$uncertainty_weight, "\n",
+          "  - fuzzify_variance:", best_fblr_params$fuzzify_variance, "\n",
+          "  - Best MAE:", best_fblr_mae, "\n") 
+    }
+
+    
+    #use the tuned up GFN operations settings to estimate missings.
+    # GFN Arithmetic using fuzzified features just for missings
+    n_missings <- length(miss_idx)
+    Y_estimated_weighted <- matrix(NA, nrow = n_missings, ncol = 2,
+                                   dimnames = list(NULL, c("Mean", "Variance")))
+    
+    for (row_i in 1:n_missings) { 
+      Y_gfn_temp <- beta0_gfn
+      
+      for (col_j in 1:ncol(X_full_z)) {
+        # Extract the fuzzified value for this observation and feature just for missings
+        X_gfn_temp <- fuzzified_features[[col_j]][miss_idx[row_i], ]  # [Mean, Variance]
+        product <- GFN.multi(beta_gfn_weighted[col_j, ], X_gfn_temp, symmetry.threshold = best_fblr_params$symmetry.threshold)
+        Y_gfn_temp <- GFN.add(Y_gfn_temp, product)
+      }
+      Y_gfn_temp <- GFN.add(Y_gfn_temp, sigma_gfn)
+      Y_estimated_weighted[row_i, ] <- Y_gfn_temp
+    }
+    
+    # Defuzzify predictions just for missings
+    pred_defuzzified_z <- apply(Y_estimated_weighted, 1, defuzzify,
+                                k = best_fblr_params$k,
+                                m = best_fblr_params$m,
+                                symmetry.threshold = best_fblr_params$symmetry.threshold)
+    
+    # Rescale to original scale just for missings
+    pred_defuzzified_orig <- pred_defuzzified_z * y_sd_train + y_mean_train
+    
+    fblr_score <- cbind(data.frame(Model = "FBLR_Bayesian_Best"), compute_metrics(actual = validate[miss_idx, target_col], pred = pred_defuzzified_orig) )
+    all_results[["FBLR_Bayesian_Best"]] <- fblr_score
+    actual_vs_imputed$FBLR_Bayesian_Best <- pred_defuzzified_orig
+    fblir_success <- TRUE
+    cat("FBLiR method completed successfully\n")
+    runTime <- toc() 
+    all_results[["FBLR_Bayesian_Best"]]$RunTime <- runTime$toc - runTime$tic 
+    #use the tuned up GFN operations settings to estimate missings.
+    
+  }, silent = FALSE)
+  
+  if(!fblir_success) {
+    cat("FBLiR method failed during execution\n")
+  }
+  
+} else {
+  cat("Insufficient observations for FBLiR method (need > 10 complete cases, found:", length(obs_idx), ")\n")
+}
+
+# ==================================================================================================
+# Results Compilation and Output
+# ==================================================================================================
+cat("\nCompiling final results...\n")
+
+final_results <- dplyr::bind_rows(all_results) %>%
+  mutate(across(c(MSE, MAE, RMSE, MAPE), as.numeric)) %>%
+  select(Model, MSE, MAE, RMSE, MAPE, RunTime) %>%
+  arrange(MSE)
+
+# Create output filenames with dataset name
+results_file <- paste0(DATASET_NAME, "_fblir_imputation_results.csv")
+values_file <- paste0(DATASET_NAME, "_fblir_actual_vs_imputed_values.csv")
+model_file <- paste0(DATASET_NAME, "_FBLR_model.txt")
+
+# Save main results
+write.csv(all_results, results_file, row.names = FALSE)
+
+# Save actual vs imputed values
+write.csv(actual_vs_imputed, values_file, row.names = FALSE)
+
+# Print summary
+cat("\n=== FBLIR IMPUTATION RESULTS FOR", DATASET_NAME, "===\n")
+if(nrow(final_results) > 0) {
+  print(final_results)
+} else {
+  cat("No results generated - FBLiR method did not run successfully\n")
+}
+
+if(nrow(final_results) > 0 && any(!is.na(final_results$MSE))) {
+  best_mse <- min(final_results$MSE, na.rm = TRUE)
+  cat("\nFBLiR Method MSE:", best_mse, "\n")
+} else {
+  cat("\nFBLiR method failed to run successfully\n")
+}
+
+cat("\nFiles saved:\n",
+    "-", results_file, "(performance metrics)\n",
+    "-", values_file, "(actual vs imputed values for analysis)\n",
+    "-", model_file, "(JAGS model file)\n")
+
+cat("\n=== FBLIR ANALYSIS COMPLETE ===\n")
