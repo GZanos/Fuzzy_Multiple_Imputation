@@ -1,0 +1,125 @@
+# USER CONFIGURATION
+# ===================
+DATASET_NAME <- "Maternal_Health.csv"  # CHANGE THIS to your desired dataset
+MISSING_PERCENTAGE <- 0.3  # Change this value to your desired missing rate
+
+
+# Function to scale/standardize data 
+scale_data <- function(data, exclude_cols = c("col_ID")) {
+  # Identify columns to scale 
+  cols_to_scale <- setdiff(names(data), exclude_cols)
+  
+  # Only scale numeric columns
+  numeric_cols <- cols_to_scale[sapply(data[cols_to_scale], is.numeric)]
+  
+  if (length(numeric_cols) == 0) {
+    cat("  - Warning: No numeric columns found to scale\n")
+    return(data)
+  }
+  
+  cat("  - Scaling columns:", paste(numeric_cols, collapse = ", "), "\n")
+  
+  # Create a copy of the data
+  scaled_data <- data
+  
+  # Apply scaling (standardization: mean=0, sd=1) to numeric columns
+  for (col in numeric_cols) {
+    if (sum(!is.na(data[[col]])) > 1) {  
+      scaled_data[[col]] <- as.numeric(scale(data[[col]]))
+    }
+  }
+  
+  return(scaled_data)
+}
+
+# Function to process the selected dataset
+process_dataset <- function(filename) {
+  # Check if file exists
+  if (!file.exists(filename)) {
+    cat("Error: File", filename, "not found.\n")
+    cat("Please check that the file exists in the current directory.\n")
+    return(NULL)
+  }
+  
+  cat("Processing:", filename, "\n")
+  data <- read.csv(filename, stringsAsFactors = FALSE)
+  
+  # Check if "Target" column exists
+  if (!"Target" %in% colnames(data)) {
+    cat("Error: 'Target' column not found in", filename, ".\n")
+    cat("Available columns:", paste(colnames(data), collapse = ", "), "\n")
+    return(NULL)
+  }
+  
+  n_rows <- nrow(data)
+  n_target_values <- sum(!is.na(data$Target))
+  
+  cat("  - Rows:", n_rows, "\n")
+  cat("  - Non-missing Target values:", n_target_values, "\n")
+  
+  cat("  - Scaling data...\n")
+  scaled_data <- scale_data(data)
+  
+  validation_data <- scaled_data
+  
+  training_data <- scaled_data
+  
+  missing_rate <- MISSING_PERCENTAGE
+  n_missing <- floor(n_target_values * missing_rate)
+  
+  non_missing_indices <- which(!is.na(training_data$Target))
+  
+  if (length(non_missing_indices) > 0 && n_missing > 0) {
+    missing_indices <- sample(non_missing_indices, min(n_missing, length(non_missing_indices)))
+    training_data$Target[missing_indices] <- NA
+  }
+  
+  cat("  - Introduced", n_missing, "missing values (", round(missing_rate*100, 1), "%) in training data\n")
+  
+  base_name <- tools::file_path_sans_ext(filename)
+  validation_filename <- paste0(base_name, "_validate.csv")
+  training_filename <- paste0(base_name, "_train.csv")
+  
+  write.csv(validation_data, validation_filename, row.names = FALSE)
+  write.csv(training_data, training_filename, row.names = FALSE)
+  
+  cat("  - Saved validation data as:", validation_filename, "\n")
+  cat("  - Saved training data as:", training_filename, "\n\n")
+  
+  return(data.frame(
+    original_file = filename,
+    validation_file = validation_filename,
+    training_file = training_filename,
+    total_rows = n_rows,
+    original_target_values = n_target_values,
+    missing_introduced = n_missing,
+    missing_rate = missing_rate,
+    scaled = TRUE
+  ))
+}
+
+cat("Starting dataset processing for imputation testing...\n")
+cat("Selected dataset:", DATASET_NAME, "\n")
+cat("Missing percentage:", MISSING_PERCENTAGE * 100, "%\n")
+cat("==========================================\n\n")
+
+result <- process_dataset(DATASET_NAME)
+
+if (!is.null(result)) {
+  cat("==========================================\n")
+  cat("PROCESSING SUMMARY:\n")
+  cat("==========================================\n")
+  print(result)
+  
+  summary_filename <- paste0(tools::file_path_sans_ext(DATASET_NAME), "_summary.csv")
+  write.csv(result, summary_filename, row.names = FALSE)
+  cat("\nSummary saved as:", summary_filename, "\n")
+  
+  cat("\nDataset processed successfully!\n")
+  cat("Files created:\n")
+  cat("  -", result$validation_file, ": Complete scaled data (for validation)\n")
+  cat("  -", result$training_file, ": Scaled data with missing Target values (for training imputation)\n")
+  cat("  -", summary_filename, ": Processing summary\n")
+} else {
+  cat("Dataset processing failed. Please check the error messages above.\n")
+}
