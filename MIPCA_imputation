@@ -1,0 +1,260 @@
+# ==================================================================================================
+# MIPCA Bayesian Imputation Method
+# Multiple Imputation using Bayesian Principal Component Analysis
+# ==================================================================================================
+
+# USER CONFIGURATION
+# ===================
+DATASET_NAME <- "tennis_men_AUS"  # Change this to any of your dataset names
+
+# MIPCA Hyperparameters
+MIPCA_CONFIG <- list(
+  ncp = NULL,              # Number of PCA components (NULL = auto-estimate with estim_ncpPCA)
+  ncp_max = 5,             # Maximum components to test during auto-estimation
+  ncp_min = 2,             # Minimum components (safety fallback if auto-estimate = 0)
+  scale = TRUE,            # Scale variables to unit variance
+  method = "Regularized",  # "Regularized" or "EM"
+  threshold = 1e-04,       # Convergence threshold
+  method_mi = "Bayes",     # "Bayes" method
+  nboot = 100,             # Number of imputed datasets to generate
+  Lstart = 1000,           # Burn-in iterations for Bayesian method
+  L = 100,                 # Iterations skipped between kept datasets
+  verbose = TRUE           # Print iteration progress
+)
+
+# ==================================================================================================
+# Setup and Data Loading
+# ==================================================================================================
+
+# --- Packages ---
+req <- c("missMDA", "Metrics", "dplyr")
+to_install <- setdiff(req, rownames(installed.packages()))
+if(length(to_install)) install.packages(to_install, dependencies = TRUE)
+
+library(missMDA)
+library(Metrics)
+library(dplyr)
+
+# --- Configuration ---
+id_col <- "col_ID"
+target_col <- "Target"
+set.seed(123)
+
+# --- Construct file paths ---
+train_file <- paste0(DATASET_NAME, "_train.csv")
+validate_file <- paste0(DATASET_NAME, "_validate.csv")
+
+# --- Check if files exist ---
+if(!file.exists(train_file)) {
+  stop(paste("Training file not found:", train_file))
+}
+if(!file.exists(validate_file)) {
+  stop(paste("Validation file not found:", validate_file))
+}
+
+cat("\n")
+cat("==================================================\n")
+cat("MIPCA Bayesian Imputation\n")
+cat("==================================================\n")
+cat("Dataset:", DATASET_NAME, "\n")
+cat("Training file:", train_file, "\n")
+cat("Validation file:", validate_file, "\n")
+cat("\n")
+
+# --- Load data ---
+train <- read.csv(train_file, stringsAsFactors = FALSE)
+validate <- read.csv(validate_file, stringsAsFactors = FALSE)
+
+# Convert target column to numeric if needed
+if(is.character(train[[target_col]])) {
+  train[[target_col]][trimws(train[[target_col]]) == ""] <- NA
+}
+train[[target_col]] <- suppressWarnings(as.numeric(train[[target_col]]))
+
+# --- Identify rows to impute & true values for validation ---
+missing_ids <- train[[id_col]][is.na(train[[target_col]])]
+cat("Number of missing values to impute:", length(missing_ids), "\n")
+
+true_vals <- validate[validate[[id_col]] %in% missing_ids, c(id_col, target_col)]
+colnames(true_vals) <- c(id_col, "true_value")
+
+# --- Ensure all predictor columns are numeric ---
+feature_cols <- setdiff(colnames(train), c(id_col, target_col))
+for (fc in feature_cols) {
+  if(!is.numeric(train[[fc]])) {
+    train[[fc]] <- suppressWarnings(as.numeric(train[[fc]]))
+  }
+}
+
+cat("Number of predictor features:", length(feature_cols), "\n")
+cat("\n")
+
+# ==================================================================================================
+# Performance Metric Functions
+# ==================================================================================================
+
+safe_mape <- function(actual, pred) {
+  actual <- as.numeric(actual)
+  pred <- as.numeric(pred)
+  ok <- !is.na(actual) & !is.na(pred) & (actual != 0)
+  if(!any(ok)) return(NA_real_)
+  mean(abs((pred[ok] - actual[ok]) / actual[ok]))
+}
+
+compute_metrics <- function(actual, pred) {
+  actual <- as.numeric(actual)
+  pred <- as.numeric(pred)
+  data.frame(
+    MSE = mean((pred - actual)^2, na.rm = TRUE),
+    MAE = mean(abs(pred - actual), na.rm = TRUE),
+    RMSE = sqrt(mean((pred - actual)^2, na.rm = TRUE)),
+    MAPE = safe_mape(actual, pred)
+  )
+}
+
+# ==================================================================================================
+# MIPCA Bayesian Imputation
+# ==================================================================================================
+
+cat("==================================================\n")
+cat("Running MIPCA with Bayesian Method\n")
+cat("==================================================\n")
+cat("Configuration:\n")
+cat("  Method:", MIPCA_CONFIG$method_mi, "\n")
+cat("  Scaling:", MIPCA_CONFIG$scale, "\n")
+cat("  Number of imputed datasets:", MIPCA_CONFIG$nboot, "\n")
+cat("  Burn-in iterations:", MIPCA_CONFIG$Lstart, "\n")
+cat("  Iterations between datasets:", MIPCA_CONFIG$L, "\n")
+cat("\n")
+
+mipca_result <- tryCatch({
+  
+  # Prepare data matrix (exclude ID column)
+  X <- train[, setdiff(colnames(train), id_col)]
+  
+  # Estimate optimal number of components if not specified
+  if(is.null(MIPCA_CONFIG$ncp)) {
+    cat("Estimating optimal number of PCA components...\n")
+    ncp_est <- estim_ncpPCA(X, ncp.max = MIPCA_CONFIG$ncp_max, scale = MIPCA_CONFIG$scale)
+    optimal_ncp <- ncp_est$ncp
+    cat("  Estimated optimal components:", optimal_ncp, "\n")
+    
+    # Safeguard: ensure minimum components for small datasets
+    if(optimal_ncp < MIPCA_CONFIG$ncp_min) {
+      cat(paste0("  WARNING: Estimated ", optimal_ncp, " components - using minimum of ", 
+                 MIPCA_CONFIG$ncp_min, " instead\n"))
+      cat("  This can happen with small datasets or low variance data\n")
+      cat("  Consider adjusting ncp_min or setting ncp manually if results are poor\n")
+      optimal_ncp <- MIPCA_CONFIG$ncp_min
+    }
+  } else {
+    optimal_ncp <- MIPCA_CONFIG$ncp
+    cat("Using specified number of components:", optimal_ncp, "\n")
+  }
+  cat("  Final number of components to use:", optimal_ncp, "\n")
+  cat("\n")
+  
+  # Run MIPCA with Bayesian method
+  cat("Running MIPCA Bayesian imputation...\n")
+  cat("(This may take a while depending on dataset size and nboot)\n")
+  cat("\n")
+  
+  res <- MIPCA(
+    X = X,
+    ncp = optimal_ncp,
+    scale = MIPCA_CONFIG$scale,
+    method = MIPCA_CONFIG$method,
+    threshold = MIPCA_CONFIG$threshold,
+    method.mi = MIPCA_CONFIG$method_mi,
+    nboot = MIPCA_CONFIG$nboot,
+    Lstart = MIPCA_CONFIG$Lstart,
+    L = MIPCA_CONFIG$L,
+    verbose = MIPCA_CONFIG$verbose
+  )
+  
+  cat("\nMIPCA completed successfully!\n")
+  cat("\n")
+  
+  # Extract imputed values from the single completed dataset (res.imputePCA)
+  imputed_data <- as.data.frame(res$res.imputePCA)
+  imputed_data[[id_col]] <- train[[id_col]]
+  
+  # Get imputed target values for missing rows
+  imputed_vals <- imputed_data[imputed_data[[id_col]] %in% missing_ids, c(id_col, target_col)]
+  colnames(imputed_vals) <- c(id_col, "imputed_value")
+  
+  # Merge with true values
+  comparison <- merge(true_vals, imputed_vals, by = id_col)
+  
+  # Calculate metrics
+  metrics <- compute_metrics(comparison$true_value, comparison$imputed_value)
+  
+  list(
+    success = TRUE,
+    method = "MIPCA_Bayesian",
+    metrics = metrics,
+    comparison = comparison,
+    imputed_data = imputed_data,
+    n_components = optimal_ncp,
+    mi_datasets = res$res.MI,  # All nboot imputed datasets
+    model = res
+  )
+  
+}, error = function(e) {
+  cat("\nError in MIPCA:\n")
+  cat(e$message, "\n\n")
+  list(
+    success = FALSE,
+    method = "MIPCA_Bayesian",
+    error = e$message
+  )
+})
+
+# ==================================================================================================
+# Results Summary
+# ==================================================================================================
+
+cat("\n")
+cat("==================================================\n")
+cat("RESULTS SUMMARY\n")
+cat("==================================================\n")
+
+if(mipca_result$success) {
+  cat("Method: MIPCA Bayesian\n")
+  cat("Status: SUCCESS\n")
+  cat("Number of PCA components used:", mipca_result$n_components, "\n")
+  cat("Number of MI datasets generated:", MIPCA_CONFIG$nboot, "\n")
+  cat("\n")
+  cat("Performance Metrics:\n")
+  cat(sprintf("  MSE:  %.6f\n", mipca_result$metrics$MSE))
+  cat(sprintf("  MAE:  %.6f\n", mipca_result$metrics$MAE))
+  cat(sprintf("  RMSE: %.6f\n", mipca_result$metrics$RMSE))
+  cat(sprintf("  MAPE: %.6f\n", mipca_result$metrics$MAPE))
+  cat("\n")
+  
+  # Save results
+  results_file <- paste0(DATASET_NAME, "_MIPCA_Bayesian_results.csv")
+  write.csv(mipca_result$metrics, results_file, row.names = FALSE)
+  cat("Results saved to:", results_file, "\n")
+  
+  # Save actual vs imputed comparison
+  comparison_file <- paste0(DATASET_NAME, "_MIPCA_Bayesian_actual_vs_imputed.csv")
+  write.csv(mipca_result$comparison, comparison_file, row.names = FALSE)
+  cat("Comparison saved to:", comparison_file, "\n")
+  
+  # Save the single completed dataset
+  completed_file <- paste0(DATASET_NAME, "_MIPCA_Bayesian_completed.csv")
+  write.csv(mipca_result$imputed_data, completed_file, row.names = FALSE)
+  cat("Completed dataset saved to:", completed_file, "\n")
+  
+  
+} else {
+  cat("Method: MIPCA Bayesian\n")
+  cat("Status: FAILED\n")
+  cat("Error:", mipca_result$error, "\n")
+}
+
+cat("\n")
+cat("==================================================\n")
+cat("Script completed!\n")
+cat("==================================================\n")
